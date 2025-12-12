@@ -76,6 +76,9 @@ last_issue: str | None = None
 # Useful to track possbile collision errors.
 PRINT_DEBUG = False
 
+# How to display heap pointers: "off" (address only), "on" (offset only), "both" (address + offset)
+heap_offset_mode = "off"
+
 PTRS_COLORS = (
     pwndbg.color.red,
     pwndbg.color.green,
@@ -216,6 +219,49 @@ class Tracker:
         self.free_watchpoints: Dict[int, FreeChunkWatchpoint] = {}
         self.memory_management_calls: Dict[int, bool] = {}
         self.colorized_heap_ptrs: Dict[int, str] = {}
+        self._heap_base: int | None = None
+
+    def get_heap_region(self) -> tuple[int, int] | None:
+        """
+        Returns the (start, end) of the [heap] segment.
+        Re-queries vmmap each time since the heap can grow via sbrk().
+        """
+        for page in pwndbg.aglib.vmmap.get():
+            if page.objfile == "[heap]":
+                # Cache base for quick access, but always get current end
+                self._heap_base = page.start
+                return (page.start, page.end)
+        return None
+
+    def format_ptr(self, ptr: int) -> str:
+        """
+        Returns a formatted string for the pointer based on heap_offset_mode setting.
+        Modes: "off" (address only), "on" (offset only), "both" (address + offset).
+        Only shows offset if pointer is within the [heap] segment boundaries.
+        """
+        colored = self.colorize_ptr(ptr)
+
+        global heap_offset_mode
+        if heap_offset_mode == "off":
+            return colored
+
+        heap_region = self.get_heap_region()
+        if heap_region is not None:
+            heap_base, heap_end = heap_region
+            if heap_base <= ptr < heap_end:
+                offset = ptr - heap_base
+                if heap_offset_mode == "on":
+                    # Offset only - apply same color to offset string
+                    color_func = PTRS_COLORS[
+                        list(self.colorized_heap_ptrs.keys()).index(ptr) % len(PTRS_COLORS)
+                        if ptr in self.colorized_heap_ptrs
+                        else len(self.colorized_heap_ptrs) % len(PTRS_COLORS)
+                    ]
+                    return color_func(f"heap+{offset:#x}")
+                else:  # "both"
+                    return f"{colored} (heap+{offset:#x})"
+
+        return colored
 
     def is_performing_memory_management(self):
         thread = gdb.selected_thread().global_num
@@ -466,7 +512,7 @@ class AllocExitBreakpoint(gdb.FinishBreakpoint):
 
         chunk = get_chunk(ret_ptr, self.requested_size)
         self.tracker.malloc(chunk)
-        ptr_str = self.tracker.colorize_ptr(ret_ptr)
+        ptr_str = self.tracker.format_ptr(ret_ptr)
         print(f"[*] {self.name} -> {ptr_str}, {chunk.size:#x} bytes real size")
 
         self.tracker.exit_memory_management()
@@ -522,7 +568,7 @@ class ReallocExitBreakpoint(gdb.FinishBreakpoint):
     def __init__(self, tracker, freed_ptr, requested_size) -> None:
         super().__init__(internal=True)
         self.freed_ptr = freed_ptr
-        self.freed_str = tracker.colorize_ptr(self.freed_ptr)
+        self.freed_str = tracker.format_ptr(self.freed_ptr)
         self.requested_size = requested_size
         self.tracker = tracker
 
@@ -558,8 +604,9 @@ class ReallocExitBreakpoint(gdb.FinishBreakpoint):
         malloc()
         self.tracker.exit_memory_management()
 
+        ret_ptr_str = self.tracker.format_ptr(ret_ptr)
         print(
-            f"[*] realloc({self.freed_str}, {self.requested_size}) -> {ret_ptr:#x}, {chunk.size:#x} bytes real size"
+            f"[*] realloc({self.freed_str}, {self.requested_size}) -> {ret_ptr_str}, {chunk.size:#x} bytes real size"
         )
         return False
 
@@ -594,7 +641,7 @@ class FreeExitBreakpoint(gdb.FinishBreakpoint):
     def __init__(self, tracker, ptr) -> None:
         super().__init__(internal=True)
         self.ptr = ptr
-        self.ptr_str = tracker.colorize_ptr(self.ptr)
+        self.ptr_str = tracker.format_ptr(self.ptr)
         self.tracker = tracker
 
     def stop(self):
